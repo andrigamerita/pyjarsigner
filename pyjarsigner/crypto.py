@@ -1,149 +1,138 @@
-# This library is free software; you can redistribute it and/or modify
-# it under the terms of the GNU Lesser General Public License as
-# published by the Free Software Foundation; either version 3 of the
-# License, or (at your option) any later version.
-#
-# This library is distributed in the hope that it will be useful, but
-# WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
-# Lesser General Public License for more details.
-#
-# You should have received a copy of the GNU Lesser General Public
-# License along with this library; if not, see
-# <http://www.gnu.org/licenses/>.
-
-
 """
 Cryptography-related functions for handling JAR signature block files.
-
-:author: Konstantin Shemyak  <konstantin@shemyak.com>
-:license: LGPL v.3
 """
 
+from cryptography.hazmat.backends import default_backend
+from cryptography.hazmat.primitives import serialization, hashes
+from cryptography.hazmat.primitives.asymmetric import (rsa, dsa, ec, padding)
+from cryptography.hazmat.primitives.serialization import pkcs7
+from cryptography import x509
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.backends.openssl import backend as openssl_backend
+import warnings
 
-from M2Crypto import SMIME, X509, BIO, RSA, DSA, EC, m2
-
+warnings.filterwarnings("ignore", category=DeprecationWarning)
 
 class CannotFindKeyTypeError(Exception):
-    """
-    Failed to determine the type of the private key.
-    """
-
     pass
-
 
 class SignatureBlockVerificationError(Exception):
-    """
-    The Signature Block File verification failed.
-    """
-
     pass
 
-
 def private_key_type(key_file):
-    """
-    Determines type of the private key: RSA, DSA, EC.
+    with open(key_file, 'rb') as f:
+        key_data = f.read()
+    try:
+        key = serialization.load_pem_private_key(
+            key_data, password=None, backend=default_backend()
+        )
+    except ValueError:
+        raise CannotFindKeyTypeError()
 
-    :param key_file: file path
-    :type key_file: str
-    :return: one of "RSA", "DSA" or "EC"
-    :except CannotFindKeyTypeError
-    """
-
-    keytypes = (("RSA", RSA), ("DSA", DSA), ("EC", EC))
-
-    for key, ktype in keytypes:
-        try:
-            ktype.load_key(key_file)
-        except:
-            continue
-        else:
-            return key
+    if isinstance(key, rsa.RSAPrivateKey):
+        return "RSA"
+    elif isinstance(key, dsa.DSAPrivateKey):
+        return "DSA"
+    elif isinstance(key, ec.EllipticCurvePrivateKey):
+        return "EC"
     else:
         raise CannotFindKeyTypeError()
 
-
 def create_signature_block(openssl_digest, certificate, private_key,
                            extra_certs, data):
-
     """
-    Produces a signature block for the data.
+    Produces a signature block for the data using PyCA/cryptography.
 
-    Reference
-    ---------
-    http://docs.oracle.com/javase/7/docs/technotes/guides/jar/jar.html#Digital_Signatures
+    :param openssl_digest: Digest algorithm (e.g., 'sha256')
+    :param certificate: Path to the certificate (PEM)
+    :param private_key: Path to the private key (PEM)
+    :param extra_certs: List of paths to additional certificates (PEM)
+    :param data: Data to be signed
+    :return: DER-encoded PKCS7 signature
+    """
+    # Load private key
+    with open(private_key, 'rb') as f:
+        key = serialization.load_pem_private_key(
+            f.read(), password=None, backend=default_backend()
+        )
 
-    Note: Oracle does not specify the content of the "signature
-    file block", friendly saying that "These are binary files
-    not intended to be interpreted by humans".
+    # Load certificate
+    with open(certificate, 'rb') as f:
+        cert = x509.load_pem_x509_certificate(f.read(), default_backend())
 
-    :param openssl_digest: alrogithm known to OpenSSL used to digest the data
-    :type openssl_digest: str
-    NOTE: not used. M2Crypto cannot pass the signing digest. This is in plans
-          for a future release: https://gitlab.com/m2crypto/m2crypto/issues/151
-    :param certificate: filename of the certificate file (PEM format)
-    :type certificate: str
-    :param private_key:filename of private key used to sign (PEM format)
-    :type private_key: str
-    :param extra_certs: additional certificates to embed into the signature (PEM format)
-    :type param: array of filenames
-    :param data: the content to be signed
-    :type data: str
-    :returns: content of the signature block file as produced by jarsigner
-    :rtype: str
-    """  # noqa
+    # Load extra certificates
+    extra_certs_objs = []
+    for cert_file in extra_certs or []:
+        with open(cert_file, 'rb') as f:
+            extra_certs_objs.append(
+                x509.load_pem_x509_certificate(f.read(), default_backend())
+            )
 
-    smime = SMIME.SMIME()
-    smime.load_key_bio(BIO.openfile(private_key), BIO.openfile(certificate))
+    # Map digest algorithm
+    hash_algorithm = {
+        'sha1': hashes.SHA1,
+        'sha256': hashes.SHA256,
+        'sha384': hashes.SHA384,
+        'sha512': hashes.SHA512,
+    }[openssl_digest.lower()]()
 
-    if extra_certs is not None:
-        # Could we use just X509.new_stack_from_der() instead?
-        stack = X509.X509_Stack()
-        for cert in extra_certs:
-            stack.push(X509.load_cert(cert))
-        smime.set_x509_stack(stack)
+    # Configure PKCS7 options
+    options = [pkcs7.PKCS7Options.DetachedSignature, pkcs7.PKCS7Options.NoAttributes]
 
-    pkcs7 = smime.sign(BIO.MemoryBuffer(data.encode()),
-                       flags=(SMIME.PKCS7_BINARY |
-                              SMIME.PKCS7_DETACHED |
-                              SMIME.PKCS7_NOATTR))
-    tmp = BIO.MemoryBuffer()
-    pkcs7.write_der(tmp)
-    return tmp.read()
+    # Build and sign PKCS7 structure
+    builder = (
+        pkcs7.PKCS7SignatureBuilder()
+        .set_data(data.encode())
+        .add_signer(cert, key, hash_algorithm)
+    )
+    if extra_certs_objs:
+        builder = builder.add_certificates(extra_certs_objs)
+
+    return builder.sign(serialization.Encoding.DER, options)
 
 
 def verify_signature_block(certificate_file, content, signature):
-    """
-    Verifies the 'signature' over the 'content', trusting the
-    'certificate'.
+    """Verifies PKCS7 signature using OpenSSL's low-level implementation."""
+    backend = default_backend()
+    openssl = openssl_backend
 
-    :param certificate_file: the trusted certificate (PEM format)
-    :type certificate_file: str
-    :param content: The signature should match this content
-    :type content: str
-    :param signature: data (DER format) subject to check
-    :type signature: str
-    :return None if the signature validates.
-    :exception SignatureBlockVerificationError
-    """
+    # Load trusted certificate
+    with open(certificate_file, 'rb') as f:
+        trusted_cert = x509.load_pem_x509_certificate(f.read(), backend)
+    
+    # Create X509_STORE and add trusted certificate
+    store = openssl._lib.X509_STORE_new()
+    openssl.openssl_assert(store != openssl._ffi.NULL)
+    ossl_cert = openssl._cert2ossl(trusted_cert)
+    res = openssl._lib.X509_STORE_add_cert(store, ossl_cert)
+    openssl.openssl_assert(res == 1)
 
-    sig_bio = BIO.MemoryBuffer(signature)
-    pkcs7 = SMIME.PKCS7(m2.pkcs7_read_bio_der(sig_bio._ptr()), 1)
-    signers_cert_stack = pkcs7.get0_signers(X509.X509_Stack())
-    trusted_cert_store = X509.X509_Store()
-    trusted_cert_store.load_info(certificate_file)
-    smime = SMIME.SMIME()
-    smime.set_x509_stack(signers_cert_stack)
-    smime.set_x509_store(trusted_cert_store)
-    data_bio = BIO.MemoryBuffer(content)
+    # Load PKCS7 structure from DER
+    bio = openssl._bytes_to_bio(signature)
+    pkcs7_ptr = openssl._lib.d2i_PKCS7_bio(bio.bio, openssl._ffi.NULL)
+    if pkcs7_ptr == openssl._ffi.NULL:
+        raise SignatureBlockVerificationError("Invalid PKCS7 structure")
 
-    try:
-        smime.verify(pkcs7, data_bio)
-    except SMIME.PKCS7_Error as message:
-        raise SignatureBlockVerificationError(message)
-    else:
-        return None
+    # Verify the signature
+    data_bio = openssl._bytes_to_bio(content.encode())
+    flags = (
+        openssl._lib.PKCS7_BINARY |
+        openssl._lib.PKCS7_NOVERIFY |
+        openssl._lib.PKCS7_NOCHAIN
+    )
+    result = openssl._lib.PKCS7_verify(
+        pkcs7_ptr,
+        openssl._ffi.NULL,  # No additional certificates
+        store,
+        data_bio.bio,
+        openssl._ffi.NULL,  # No output BIO
+        flags
+    )
 
+    if result != 1:
+        error = openssl._consume_errors()
+        raise SignatureBlockVerificationError(
+            f"Verification failed: {openssl._errors_with_text(error)}"
+        )
 
-#
-# The end.
+    return None
